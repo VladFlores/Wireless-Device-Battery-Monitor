@@ -12,7 +12,6 @@
 // Legacy BB semantics are restricted to the product IDs above; other Telink firmware differs.
 #include "drivers.h"
 #include "rapoo_protocol.h"
-
 #include <algorithm>
 
 namespace {
