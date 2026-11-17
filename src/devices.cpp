@@ -72,6 +72,7 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollRapoo(ctx);
     PollAreson(ctx);
     PollMchoseG3(ctx);
+    PollMchoseV9(ctx);
     PollMiscMice(ctx);
     PollFantech(ctx);
     PollRazerHeadsets(ctx);  // before the generic Razer driver, which shares the vendor id
