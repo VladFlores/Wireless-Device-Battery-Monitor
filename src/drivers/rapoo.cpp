@@ -49,8 +49,8 @@ const Model* FindModel(USHORT pid) {
 // Mice confirmed to send the 7-byte BB B0 status report.
 bool IsLegacyVT3Pro(USHORT pid) {
     return pid == 0x1215 || pid == 0x4415 ||  // VT3 Pro
-           pid == 0x1233 || pid == 0x4433;    // VT1 Pro Max (issue #136 captures)
-           pid == 0x185A;
+           pid == 0x1233 || pid == 0x4433 ||  // VT1 Pro Max (issue #136 captures)
+           pid == 0x185A;    // <-- Receptor 1K do Rapoo VT9 Pro
 }
 
 bool ReadBattery(HidDev& d, Rapoo::Battery& battery, Rapoo::Profile profile) {
