@@ -1,67 +1,77 @@
-// MCHOSE V9 Pro 2 wireless headset (VID 3837, receiver PID 6011).
-// Protocol taken from USBPcap captures of the official MCHOSE software (not from vendor docs).
-// The vendor collection is FF07:0222, 64-byte input and output reports, report ID 55.
-//
-//   Request: 55 AA 01 00 <len> 00 <cmd hi> <cmd lo> <data...>
-//   Reply:   55 AA 01 01 <len> 00 <cmd hi> <cmd lo> <data...> <checksum>
-//   <len> counts the data bytes plus the checksum. In every captured reply the checksum is the
-//   XOR of bytes 2 and 4..(last data byte), but it is not verified here.
-//
-// Battery: command 01 0B, data [8] = connected (01) / offline (00), [9] = battery value.
-//   The headset also pushes the same pair unprompted (command 04 22): 00 FF when it is off,
-//   01 57 when it is on. 0x57 = 87, while the official software showed 90%, so the value may be
-//   rounded there. NOT YET CONFIRMED beyond one battery level: compare with the official
-//   software over a few days of use. Charging state is not known yet.
+// MCHOSE wireless mice on the 2.4 GHz receiver or USB cable (VID 5253): L7 / L7 Pro / L7 Ultra,
+// M7 / M7 Ultra, A7 / A7 Ultra, K7 (the receiver PID is 1020 for several of them, so the model is
+// not told apart by PID; the product string is used for the name).
+//   request: 65-byte feature report on the vendor collection FF01:0001, report id 0x12, payload
+//            [06 00 00 ...] with EVERY payload byte inverted (^ 0xFF), padding included
+//   reply:   the same report read back: [12][F9 = 06 ^ FF][payload, inverted]
+//            payload = vid:u16 (5253), model:u16, firmware:u32, flags:u8 (09 on the receiver,
+//            00 on the cable), level:u8, charging:u8
+// The receiver only has a value while the mouse itself is awake: asleep, it still echoes the
+// command but with an all-zero payload, so that is reported as "asleep" (the last value is kept).
+// The request must be sent again for every read attempt; reading again without asking returns
+// the request itself.
+// Protocol: github.com/alexfrih/mchose-linux (PROTOCOL.md, recovered from MCHOSE's M HUB driver),
+// confirmed on a real MCHOSE L7 Ultra (5253:1020, receiver).
 #include "drivers.h"
 
 namespace {
 
-// Writes `req` and returns the first input report accepted by `match` within `timeoutMs`.
-template <class Match>
-bool Query(HidDev& d, const std::vector<BYTE>& req, std::vector<BYTE>& resp, int timeoutMs, Match match) {
-    if (!d.Write(req)) return false;
-    ULONGLONG end = GetTickCount64() + timeoutMs;
-    for (;;) {
-        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
-        if (left <= 0 || d.Read(resp, left) < 0) return false;
-        if (match(resp)) return true;
-    }
-}
+const USHORT kVid = 0x5253;
+const BYTE kReport = 0x12;
+const BYTE kCmdStatus = 0x06;
 
-bool V9Pro2(const HidColl& c, DeviceStatus& s) {
-    HidDev d;
-    if (!d.Open(c)) return false;
-
-    // Command 01 0B with one data byte (00), exactly as the official software sends it.
-    const std::vector<BYTE> req = { 0x55, 0xAA, 0x01, 0x00, 0x01, 0x00, 0x01, 0x0B, 0x00 };
-    std::vector<BYTE> r;
-    // Reports on this collection can also be unsolicited (04 22), so wait for the 01 0B reply.
-    bool ok = Query(d, req, r, 1000, [](const std::vector<BYTE>& r) {
-        return r.size() >= 10 && r[0] == 0x55 && r[1] == 0xAA && r[3] == 0x01 && r[6] == 0x01 && r[7] == 0x0B;
-    });
-    if (!ok) return false;
-
-    s.key = L"mchose:" + Hex4(c.pid);
-    s.name = L"MCHOSE V9 Pro 2";
-    s.kind = DeviceKind::Headset;
-    s.via = L"2.4 GHz receiver";
-    s.connected = r[8] != 0;
-    if (s.connected && r[9] <= 100) s.percent = r[9];
-    return true;
+// Returns 1 for a status reply, 0 for a valid echo with an empty payload (mouse asleep), -1 otherwise.
+int ParseStatus(const std::vector<BYTE>& r, int& level, int& charging, int& flags) {
+    if (r.size() < 13 || r[0] != kReport || r[1] != (kCmdStatus ^ 0xFF)) return -1;
+    BYTE p[11];
+    for (int i = 0; i < 11; i++) p[i] = r[2 + i] ^ 0xFF;
+    bool allZero = true;
+    for (BYTE b : p)
+        if (b) allZero = false;
+    if (allZero) return 0;
+    if ((p[0] | (p[1] << 8)) != kVid) return -1;
+    level = p[9];
+    charging = p[10];
+    flags = p[8];
+    return level <= 100 ? 1 : -1;
 }
 
 }  // namespace
 
 void PollMchose(PollContext& ctx) {
-    const USHORT vid = 0x3837;
-    const USHORT pid = 0x6011;
-    if (ctx.IsClaimed(vid, pid)) return;
-    for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) {
-             // The receiver also exposes consumer-control and telephony collections; only this one
-             // carries the vendor protocol.
-             return c.page() == 0xFF07 && c.usage() == 0x0222 && c.outLen() == 64 && c.inLen() == 64;
-         })) {
-        DeviceStatus s;
-        if (V9Pro2(*c, s)) { ctx.Add(s, vid, pid); break; }
+    for (auto [vid, pid] : ctx.Products(kVid)) {
+        for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.page() == 0xFF01 && c.usage() == 0x0001 && c.featLen() >= 65; })) {
+            HidDev d;
+            if (!d.OpenFeatureOnly(*c)) continue;
+            std::vector<BYTE> req(c->featLen(), 0xFF);  // inverted zero padding
+            req[0] = kReport;
+            req[1] = kCmdStatus ^ 0xFF;
+            int state = -1, level = 0, charging = 0, flags = 0;
+            for (int attempt = 0; attempt < 5 && state != 1; attempt++) {
+                if (attempt) Sleep(100);
+                std::vector<BYTE> r;
+                if (!d.SetFeature(req)) break;
+                Sleep(120);
+                if (!d.GetFeature(kReport, r)) continue;
+                int st = ParseStatus(r, level, charging, flags);
+                if (st > state) state = st;
+            }
+            if (state < 0) continue;  // not answering this protocol
+            DeviceStatus s;
+            s.key = L"mchose:" + Hex4(pid);
+            s.name = HidProduct(*c);
+            if (s.name.empty()) s.name = L"MCHOSE mouse";
+            s.kind = DeviceKind::Mouse;
+            if (state == 1) {
+                s.percent = Clamp100(level);
+                s.charging = charging != 0;
+                s.via = flags == 0 && charging ? L"USB cable" : L"2.4 GHz receiver";
+            } else {
+                s.asleep = true;
+                s.via = L"2.4 GHz receiver";
+            }
+            ctx.Add(s, vid, pid);
+            break;
+        }
     }
 }
